@@ -379,3 +379,44 @@ int test_pagetable() {
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
 }
+
+void
+_vmprint(pagetable_t pagetable, uint64 va, int level) 
+{
+  if (level == 0)
+    printf("page table %p\n", pagetable);
+  for (int i = 0; i < 512; i++, va++)
+  {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V)
+    {
+      pagetable_t child = (pagetable_t) PTE2PA(pte);
+      char flags[6] = "----\n";
+      if (pte & PTE_R)
+        flags[0] = 'r';
+      if (pte & PTE_W)
+        flags[1] = 'w';
+      if (pte & PTE_X)
+        flags[2] = 'x';
+      if (pte & PTE_U)
+        flags[3] = 'u';
+      printf("||");
+      for (int i = 0; i < level; i++)
+        printf("   ||");
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) 
+      {
+        printf("idx: %d: pa: %p, flags: %s", i, child, flags);
+        _vmprint(child, va << 9, level + 1);
+      } 
+      else 
+      {
+        printf("idx: %d: va: %p -> pa: %p, flags: %s", i, va << 12, child, flags);
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable)
+{
+  _vmprint(pagetable, 0, 0);
+}
