@@ -127,7 +127,7 @@ found:
   return p;
 }
 
-static void _freewalk(pagetable_t pagetable) {
+void _freewalk(pagetable_t pagetable) {
   for (int i = 0; i < 512; i++) {
     pte_t pte = pagetable[i];
     if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
@@ -213,6 +213,7 @@ void userinit(void) {
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  sync_pagetable(p->pagetable, p->k_pagetable);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -237,7 +238,12 @@ int growproc(int n) {
     if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    sync_pagetable(p->pagetable, p->k_pagetable);
   } else if (n < 0) {
+    if (PGROUNDUP(sz + n) < PGROUNDUP(sz)) {
+      int npages = (PGROUNDUP(sz) - PGROUNDUP(sz + n)) / PGSIZE;
+      uvmunmap(p->k_pagetable, PGROUNDUP(sz + n), npages, 0);
+    }
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
@@ -263,6 +269,8 @@ int fork(void) {
     return -1;
   }
   np->sz = p->sz;
+
+  sync_pagetable(np->pagetable, np->k_pagetable);
 
   np->parent = p;
 
@@ -359,6 +367,9 @@ void exit(int status) {
 
   acquire(&p->lock);
 
+  w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
+
   // Give any children to init.
   reparent(p);
 
@@ -434,6 +445,8 @@ int wait(uint64 addr) {
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
 void scheduler(void) {
+  w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
   struct proc *p;
   struct cpu *c = mycpu();
 

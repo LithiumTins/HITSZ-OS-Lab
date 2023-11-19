@@ -15,6 +15,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[];  // trampoline.S
 
+extern void _freewalk(pagetable_t pagetable);
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -316,21 +318,10 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  w_sstatus(r_sstatus() | (1 << 18));
+  int ret = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus(r_sstatus() & ~(1 << 18));
+  return ret;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,38 +329,10 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  w_sstatus(r_sstatus() | (1 << 18));
+  int ret = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus(r_sstatus() & ~(1 << 18));
+  return ret;
 }
 
 // check if use global kpgtbl or not
@@ -429,31 +392,55 @@ pagetable_t proc_kvminit()
 
   // uart registers
   mappages(k_pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W);
-  // kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
 
   // virtio mmio disk interface
   mappages(k_pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W);
-  // kvmmap(VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-
-  // CLINT (not mapped)
-  // kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
 
   // PLIC
   mappages(k_pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W);
-  // kvmmap(PLIC, PLIC, 0x400000, PTE_R | PTE_W);
 
   // map kernel text executable and read-only.
   mappages(k_pagetable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X);
-  // kvmmap(KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
 
   // map kernel data and the physical RAM we'll make use of.
   mappages(k_pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W);
-  // kvmmap((uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
 
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   mappages(k_pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X);
-  // kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
   return k_pagetable;
+}
+
+void _sync_pagetable(pagetable_t proc, pagetable_t kernel, uint64 va, int level) 
+{
+  for (int i = 0; i < 512; i++, va++) 
+  {
+    if ((va << (level * 9 + 12)) >= PLIC)
+      return;
+    pte_t p = proc[i];
+    pte_t k = kernel[i];
+    if ((p & PTE_V) && !(k & PTE_V))
+    {
+      if ((p & (PTE_R | PTE_W | PTE_X)) == 0)
+      {
+        pagetable_t pa = kalloc();
+        memset(pa, 0, PGSIZE);
+        kernel[i] = PA2PTE(pa) | (p & (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U));
+      }
+      else
+      {
+        kernel[i] = p;
+      }
+    }
+    if ((p & PTE_V) && (p & (PTE_R | PTE_W | PTE_X)) == 0)
+    {
+      _sync_pagetable((pagetable_t) PTE2PA(p), (pagetable_t) PTE2PA(kernel[i]), va << 9, level - 1);
+    }
+  }
+}
+
+void sync_pagetable(pagetable_t proc, pagetable_t kernel)
+{
+  _sync_pagetable(proc, kernel, 0, 2);
 }

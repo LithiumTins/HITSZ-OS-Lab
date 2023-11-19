@@ -9,6 +9,8 @@
 
 static int loadseg(pde_t *pgdir, uint64 addr, struct inode *ip, uint offset, uint sz);
 
+extern pagetable_t kernel_pagetable;
+
 int exec(char *path, char **argv) {
   char *s, *last;
   int i, off;
@@ -89,6 +91,19 @@ int exec(char *path, char **argv) {
     if (*s == '/') last = s + 1;
   safestrcpy(p->name, last, sizeof(p->name));
 
+  // free process' kernel pagetable and remake one
+  pagetable_t tmp = p->k_pagetable;
+  p->k_pagetable = kernel_pagetable;
+  w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
+  _freewalk(tmp);
+  tmp = proc_kvminit();
+  mappages(tmp, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W);
+  sync_pagetable(pagetable, tmp);
+  p->k_pagetable = tmp;
+  w_satp(MAKE_SATP(p->k_pagetable));
+  sfence_vma();
+
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
@@ -108,6 +123,7 @@ bad:
     iunlockput(ip);
     end_op();
   }
+
   return -1;
 }
 
