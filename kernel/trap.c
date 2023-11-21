@@ -36,6 +36,9 @@ void usertrap(void) {
 
   struct proc *p = myproc();
 
+  w_satp(MAKE_SATP(p->k_pagetable));
+  sfence_vma();
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
 

@@ -21,6 +21,8 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[];  // trampoline.S
 
+extern pagetable_t kernel_pagetable;
+
 // initialize the proc table at boot time.
 void procinit(void) {
   struct proc *p;
@@ -37,6 +39,7 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    p->kstack_pa = (uint64)pa;
   }
   kvminithart();
 }
@@ -111,6 +114,10 @@ found:
     return 0;
   }
 
+  // Set up process kernel page table.
+  p->k_pagetable = proc_kvminit();
+  mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -118,6 +125,19 @@ found:
   p->context.sp = p->kstack + PGSIZE;
 
   return p;
+}
+
+void _freewalk(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      _freewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
 }
 
 // free a proc structure and the data hanging from it,
@@ -136,6 +156,7 @@ static void freeproc(struct proc *p) {
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  if (p->k_pagetable) _freewalk(p->k_pagetable);
 }
 
 // Create a user page table for a given process,
@@ -192,6 +213,7 @@ void userinit(void) {
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  sync_pagetable(p->pagetable, p->k_pagetable);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -216,7 +238,12 @@ int growproc(int n) {
     if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    sync_pagetable(p->pagetable, p->k_pagetable);
   } else if (n < 0) {
+    if (PGROUNDUP(sz + n) < PGROUNDUP(sz)) {
+      int npages = (PGROUNDUP(sz) - PGROUNDUP(sz + n)) / PGSIZE;
+      uvmunmap(p->k_pagetable, PGROUNDUP(sz + n), npages, 0);
+    }
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
@@ -242,6 +269,8 @@ int fork(void) {
     return -1;
   }
   np->sz = p->sz;
+
+  sync_pagetable(np->pagetable, np->k_pagetable);
 
   np->parent = p;
 
@@ -338,6 +367,9 @@ void exit(int status) {
 
   acquire(&p->lock);
 
+  w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
+
   // Give any children to init.
   reparent(p);
 
@@ -413,6 +445,8 @@ int wait(uint64 addr) {
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
 void scheduler(void) {
+  w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
   struct proc *p;
   struct cpu *c = mycpu();
 
@@ -430,7 +464,14 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
